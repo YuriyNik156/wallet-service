@@ -1,0 +1,19 @@
+[tool.ruff]
+line-length = 79
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "B"]
+
+[tool.ruff.lint.isort]
+# Каталог alembic/ в корне не должен считаться first-party пакетом.
+known-third-party = ["alembic"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+asyncio_mode = "auto"
+# Один event loop на всю сессию: пул asyncpg-соединений не переживает
+# закрытие loop, поэтому loop не должен пересоздаваться для каждого теста.
+asyncio_default_fixture_loop_scope = "session"
+asyncio_default_test_loop_scope = "session"
