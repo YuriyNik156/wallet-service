@@ -2,7 +2,7 @@ import asyncio
 import uuid
 
 import pytest
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
 
 from app.schemas import MAX_AMOUNT
 
@@ -194,6 +194,94 @@ async def test_concurrent_deposits_and_withdrawals(client, create_wallet):
     assert final == expected
     assert final >= 0
     assert all(code == 200 for code in statuses[:5])
+
+
+async def test_concurrent_withdrawals_exactly_one_succeeds(
+    client, create_wallet
+):
+    """Баланс 300, два списания по 200: итог не зависит от порядка.
+
+    Сценарий повторяется на 20 кошельках в одном gather: пересечение
+    транзакций на каком-либо кошельке становится вероятным. Без блокировки
+    оба запроса прочитали бы 300 и оба вернули бы 200 (баланс 100).
+    Детерминированную проверку блокировки даёт test_operation_waits_for_
+    row_lock; этот тест не гарантирует воспроизведения гонки.
+    """
+    wallet_ids = [await create_wallet(300) for _ in range(20)]
+
+    responses = await asyncio.gather(
+        *(
+            operation(client, wallet_id, "WITHDRAW", 200)
+            for wallet_id in wallet_ids
+            for _ in range(2)
+        )
+    )
+
+    for index, wallet_id in enumerate(wallet_ids):
+        pair = responses[2 * index : 2 * index + 2]
+        assert sorted(r.status_code for r in pair) == [200, 409]
+        assert await get_balance(client, wallet_id) == 100
+
+
+async def test_concurrent_deposits_are_not_lost(client, create_wallet):
+    wallet_id = await create_wallet(1000)
+
+    responses = await asyncio.gather(
+        *(operation(client, wallet_id, "DEPOSIT", 100) for _ in range(20))
+    )
+
+    assert [r.status_code for r in responses] == [200] * 20
+    assert await get_balance(client, wallet_id) == 1000 + 20 * 100
+
+
+async def read_updated_at(wallet_id):
+    from app.database import SessionFactory
+    from app.models import Wallet
+
+    async with SessionFactory() as session:
+        return await session.scalar(
+            select(Wallet.updated_at).where(Wallet.id == wallet_id)
+        )
+
+
+async def test_updated_at_changes_only_on_success(client, create_wallet):
+    wallet_id = await create_wallet(100)
+    initial = await read_updated_at(wallet_id)
+
+    await operation(client, wallet_id, "WITHDRAW", 500)  # 409
+    assert await read_updated_at(wallet_id) == initial
+
+    response = await operation(client, wallet_id, "DEPOSIT", 50)
+    assert response.status_code == 200
+    assert await read_updated_at(wallet_id) > initial
+
+
+async def test_updated_at_is_taken_after_lock_wait(client, create_wallet):
+    """updated_at не раньше момента освобождения блокировки.
+
+    С now() значение — время начала транзакции запроса, т.е. до ожидания
+    блокировки, и оказалось бы раньше момента освобождения.
+    """
+    from app.database import SessionFactory
+    from app.models import Wallet
+
+    wallet_id = await create_wallet(1000)
+
+    async with SessionFactory() as locker:
+        async with locker.begin():
+            await locker.execute(
+                select(Wallet).where(Wallet.id == wallet_id).with_for_update()
+            )
+            pending = asyncio.create_task(
+                operation(client, wallet_id, "DEPOSIT", 1)
+            )
+            await asyncio.sleep(0.5)
+            released_at = await locker.scalar(select(func.clock_timestamp()))
+
+    response = await asyncio.wait_for(pending, timeout=5)
+
+    assert response.status_code == 200
+    assert await read_updated_at(wallet_id) >= released_at
 
 
 async def test_operation_waits_for_row_lock(client, create_wallet):

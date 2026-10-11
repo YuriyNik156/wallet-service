@@ -62,7 +62,9 @@ async def apply_operation(
                     status.HTTP_409_CONFLICT, "Insufficient funds"
                 )
             wallet.balance -= Decimal(amount)
-        wallet.updated_at = func.now()
+        # statement_timestamp(), а не now(): now() — время начала транзакции,
+        # которое для ожидавшего блокировку запроса раньше момента записи.
+        wallet.updated_at = func.statement_timestamp()
     return wallet
 
 
